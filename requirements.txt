@@ -1,0 +1,10 @@
+# Versiones mínimas con las que se probó el proyecto (Python 3.12)
+langchain-core>=1.6.5
+langchain-openai>=1.6.6
+langchain-anthropic>=1.7.4
+pydantic>=2.13
+python-dotenv>=1.2
+
+# tests
+pytest>=9.1
+pytest-asyncio>=1.4
