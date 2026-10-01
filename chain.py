@@ -1,6 +1,7 @@
 """Pipeline LCEL: prompt | modelo con salida estructurada | verificación, envuelto en reintentos."""
 import logging
 import os
+import re
 import time
 from collections.abc import Callable
 
@@ -15,6 +16,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
+from pydantic import ValidationError
 
 from schemas import EntidadesTecnicas
 
@@ -100,6 +102,13 @@ def get_model(provider: str | None = None) -> BaseChatModel:
 
 
 # ---------- verificación ----------
+def _resumen_parseo(error: BaseException) -> str:
+    # Un ValidationError de Pydantic ocupa varias líneas; para el log alcanza con "campo: mensaje".
+    if isinstance(error, ValidationError):
+        return "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in error.errors())
+    return " ".join(str(error).split())
+
+
 def _rechazar(motivo: str) -> SalidaInvalidaError:
     log.warning("validacion=rechazada motivo=%s", motivo)
     return SalidaInvalidaError(motivo)
@@ -120,7 +129,7 @@ def verificar_salida(resultado: dict) -> EntidadesTecnicas:
     error = resultado.get("parsing_error")
     if error is not None:
         # JSON mal formado, campos faltantes o una regla de EntidadesTecnicas que no se cumple.
-        raise _rechazar(f"no pasó el parseo/validación: {error}") from error
+        raise _rechazar(f"no pasó el parseo/validación: {_resumen_parseo(error)}") from error
 
     parsed = resultado.get("parsed")
     if not isinstance(parsed, EntidadesTecnicas):
@@ -132,10 +141,17 @@ def verificar_salida(resultado: dict) -> EntidadesTecnicas:
     return parsed
 
 
+def _resumen_error(traza: str | None) -> str:
+    # run.error es el traceback completo. Nos quedamos con la última línea "Tipo: mensaje"
+    # (la última línea a secas puede ser el pie de un error de varias líneas, como los de Pydantic).
+    lineas = re.findall(r"^[A-Za-z_][\w.]*: .*$", traza or "", flags=re.MULTILINE)
+    return lineas[-1] if lineas else (traza or "?").strip()[:200]
+
+
 def _log_error_modelo(run) -> None:
     # Se dispara en cada intento fallido de la llamada al modelo (429, timeout, 401...).
     # No guarda estado: cada ejecución loguea lo suyo, aunque haya varias en paralelo.
-    log.warning("llamada_al_modelo=fallida error=%s", run.error.strip().splitlines()[-1] if run.error else "?")
+    log.warning("llamada_al_modelo=fallida error=%s", _resumen_error(run.error))
 
 
 # ---------- cadena ----------
@@ -149,7 +165,13 @@ def build_chain(
     """Arma la cadena completa. `model` permite inyectar un modelo falso en los tests;
     `backoff_inicial_s=0` elimina la espera entre reintentos."""
     model = model or get_model(provider)
-    estructurado = model.with_structured_output(EntidadesTecnicas, include_raw=True)
+    # function_calling explícito: ChatOpenAI usa json_schema por defecto, y ahí el SDK de OpenAI
+    # valida DENTRO de la llamada al modelo. Un ValidationError (o LengthFinishReasonError si se
+    # corta) saldría crudo, sin pasar por include_raw ni por verificar_salida, y no se reintentaría.
+    # Con function_calling el parseo lo hace LangChain después, y es el mismo método que usa Anthropic.
+    estructurado = model.with_structured_output(
+        EntidadesTecnicas, method="function_calling", include_raw=True
+    )
     chain = (
         PROMPT
         | estructurado.with_listeners(on_error=_log_error_modelo)

@@ -14,6 +14,7 @@ from langchain_core.exceptions import (
     OutputParserException,
 )
 from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from langchain_openai.chat_models.base import OpenAIAuthenticationError, OpenAIRateLimitError
@@ -76,8 +77,8 @@ class FakeModel:
         self.llamadas = 0
         self.prompts = []  # lo que le llegó al modelo en cada llamada
 
-    def with_structured_output(self, schema, include_raw=False):
-        assert schema is EntidadesTecnicas and include_raw is True
+    def with_structured_output(self, schema, method=None, include_raw=False):
+        assert schema is EntidadesTecnicas and include_raw is True and method == "function_calling"
 
         def responder(prompt_value):
             self.llamadas += 1
@@ -224,6 +225,60 @@ def test_errores_de_langchain_openai_heredan_de_langchain_core():
     assert isinstance(key_invalida(), ModelAuthenticationError)
     crudo = openai.RateLimitError("Rate limit", response=_response(429), body=None)
     assert not isinstance(crudo, ModelRateLimitError)  # por eso los tests no usan el error crudo
+
+
+# ---------- integración con los modelos reales de LangChain (sin red) ----------
+# Se reemplaza solo _agenerate, el punto donde ChatOpenAI/ChatAnthropic salen a la API.
+# Así el parseo y el include_raw son los de verdad, no los del FakeModel.
+@pytest.fixture(params=["openai", "anthropic"])
+def modelo_real(request, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-falsa")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-falsa")
+    clase = {"openai": ChatOpenAI, "anthropic": ChatAnthropic}[request.param]
+    guion, pedidos = [], []
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        pedidos.append(kwargs)
+        args, fin = guion.pop(0)
+        meta = {"finish_reason": fin} if request.param == "openai" else {"stop_reason": fin}
+        msg = AIMessage(content="", response_metadata=meta,
+                        tool_calls=[{"name": "EntidadesTecnicas", "args": args, "id": "call_1"}])
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+    monkeypatch.setattr(clase, "_agenerate", _agenerate)
+    fin_ok, fin_cortado = ("stop", "length") if request.param == "openai" else ("tool_use", "max_tokens")
+    return get_model(request.param), guion, pedidos, fin_ok, fin_cortado
+
+
+async def test_modelo_real_usa_function_calling(modelo_real):
+    # Con json_schema (el default de ChatOpenAI) el SDK valida dentro de la llamada y un
+    # ValidationError saldría sin reintentarse. El pedido tiene que ir como herramienta.
+    model, guion, pedidos, fin_ok, _ = modelo_real
+    guion.append((VALIDO, fin_ok))
+    await process_text(TEXTO, chain=build_chain(model, backoff_inicial_s=0))
+    assert "tools" in pedidos[0] and "response_format" not in pedidos[0]
+
+
+async def test_modelo_real_lista_vacia_se_reintenta(modelo_real):
+    model, guion, pedidos, fin_ok, _ = modelo_real
+    guion.extend([({**VALIDO, "tecnologias": []}, fin_ok), (VALIDO, fin_ok)])
+    resultado = await process_text(TEXTO, chain=build_chain(model, backoff_inicial_s=0))
+    assert resultado.tecnologias == VALIDO["tecnologias"] and len(pedidos) == 2
+
+
+async def test_modelo_real_respuesta_cortada_se_reintenta(modelo_real):
+    model, guion, pedidos, fin_ok, fin_cortado = modelo_real
+    guion.extend([(VALIDO, fin_cortado), (VALIDO, fin_ok)])
+    await process_text(TEXTO, chain=build_chain(model, backoff_inicial_s=0))
+    assert len(pedidos) == 2
+
+
+async def test_modelo_real_texto_sin_tecnologias_falla_tras_3_intentos(modelo_real):
+    model, guion, pedidos, fin_ok, _ = modelo_real
+    guion.extend([({**VALIDO, "tecnologias": []}, fin_ok)] * 3)
+    with pytest.raises(SalidaInvalidaError):
+        await process_text(TEXTO, chain=build_chain(model, backoff_inicial_s=0))
+    assert len(pedidos) == 3
 
 
 # ---------- logging ----------
